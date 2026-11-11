@@ -1,0 +1,10 @@
+[project]
+name = "govkit"
+version = "0.1.0"
+description = "Reference implementations: evidence-graded reports and rollback-first changes"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[tool.mypy]
+strict = true
