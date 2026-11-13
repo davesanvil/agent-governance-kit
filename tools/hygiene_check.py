@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ALLOWED_HOSTS = {"localhost", "example.com", "example.org", "example.net", "registry.npmjs.org"}
-ALLOWED_EMAIL = re.compile(r"@(?:users\.noreply\.github\.com|example\.(?:com|org|net))$", re.I)
+ALLOWED_EMAIL = re.compile(r"(?:^noreply@github\.com|@(?:users\.noreply\.github\.com|example\.(?:com|org|net)))$", re.I)
 DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
 
 IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.]*\d)")

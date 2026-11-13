@@ -77,6 +77,21 @@ class RepoTest(unittest.TestCase):
             found = {f.kind for f in scan_repo(Path(d), [])}
         self.assertEqual(found, {"commit-email", "commit-trailer"})
 
+    def test_github_platform_noreply(self) -> None:
+        email = "noreply" + "@github.com"
+        self.assertEqual(scan_text(email, "x", []), [])
+        with tempfile.TemporaryDirectory() as d:
+            self.make_repo(Path(d), email, "Merge reviewed change")
+            self.assertEqual(scan_repo(Path(d), []), [])
+
+    def test_platform_noreply_exemption_is_exact(self) -> None:
+        for email in ("other" + "@github.com", "x+noreply" + "@github.com",
+                      "noreply" + "@github.com.invalid"):
+            with self.subTest(email=email), tempfile.TemporaryDirectory() as d:
+                self.assertEqual(kinds(email), {"email"})
+                self.make_repo(Path(d), email, "Initial commit")
+                self.assertEqual({f.kind for f in scan_repo(Path(d), [])}, {"commit-email"})
+
     def test_untracked_files_are_not_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             self.make_repo(Path(d), NOREPLY, "Initial commit")
