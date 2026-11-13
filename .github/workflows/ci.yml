@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   python:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -29,6 +30,7 @@ jobs:
       - run: python -m unittest discover -s tests -v
 
   typescript:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,6 +50,7 @@ jobs:
       - run: npm test
 
   hygiene:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
