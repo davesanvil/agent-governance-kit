@@ -9,7 +9,7 @@ on:
         type: number
         default: 0
       config-path:
-        description: Optional path to a gitleaks config file (defaults to repo .gitleaks.toml when present)
+        description: Optional path to a gitleaks config file (defaults to repo .gitleaks.toml, else bundled baseline)
         required: false
         type: string
         default: ""
@@ -37,10 +37,79 @@ jobs:
         with:
           fetch-depth: ${{ inputs.fetch-depth || 0 }}
           persist-credentials: false
+      - name: Resolve gitleaks configuration
+        id: config
+        shell: bash
+        env:
+          INPUT_CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_CONFIG_PATH" ]; then
+            case "$INPUT_CONFIG_PATH" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::config-path must be a single line" >&2
+                exit 1
+                ;;
+            esac
+            printf 'path=%s\n' "$INPUT_CONFIG_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -f .gitleaks.toml ]; then
+            printf 'path=.gitleaks.toml\n' >> "$GITHUB_OUTPUT"
+          else
+            fallback="${RUNNER_TEMP}/govkit-default.gitleaks.toml"
+            cat <<'GOVKIT_GITLEAKS_EOF' > "$fallback"
+          title = "agent-governance-kit gitleaks configuration"
+
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "onepassword-service-account-token-extended"
+          description = "1Password Service Account Token (standard base64, base64url, or short payload)"
+          regex = '''ops_[A-Za-z0-9+/._-]{100,}={0,3}'''
+          keywords = ["ops_"]
+
+            [[rules.allowlists]]
+            description = "Anchored synthetic 1Password service account token placeholders"
+            regexTarget = "match"
+            regexes = [
+              '''^ops_(?:eyJ)?(?:[Xx]{100,}|0{100,})={0,3}$''',
+              '''^ops_(?:EXAMPLE|DUMMY|PLACEHOLDER|REDACTED)[A-Za-z0-9+/._-]*={0,3}$''',
+              '''^ops_[A-Za-z0-9+/._-]*(?:EXAMPLE|DUMMY|PLACEHOLDER|REDACTED)={0,3}$''',
+            ]
+
+          [[rules]]
+          id = "onepassword-secret-key"
+          description = "1Password Account Secret Key"
+          regex = '''\bA3-[A-Z0-9]{6}-(?:[A-Z0-9]{6}-[A-Z0-9]{5}|[A-Z0-9]{11})-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}\b'''
+          keywords = ["A3-"]
+
+            [[rules.allowlists]]
+            description = "Anchored synthetic 1Password secret key placeholders"
+            regexTarget = "match"
+            regexes = [
+              '''^A3-(?:X{6}-(?:X{6}-X{5}|X{11})-X{5}-X{5}-X{5}|0{6}-(?:0{6}-0{5}|0{11})-0{5}-0{5}-0{5})$''',
+              '''^A3-[A-Z0-9]{6}-(?:(?:X{6}|0{6}|DUMMY[A-Z0-9]|EXAMP[A-Z0-9]|REDAC[A-Z0-9]|PLACE[A-Z0-9]|TEST[A-Z0-9]{2})-(?:X{5}|0{5}|DUMMY|EXAMP|REDAC|PLACE|HOLDR|TEST[A-Z0-9])|(?:X{11}|0{11}|PLACEHOLDER|EXAMPLE[A-Z0-9]{4}|REDACTED[A-Z0-9]{3}|DUMMY[A-Z0-9]{6}))-(?:X{5}|0{5}|DUMMY|EXAMP|REDAC|PLACE|HOLDR|TEST[A-Z0-9])-(?:X{5}|0{5}|DUMMY|EXAMP|REDAC|PLACE|HOLDR|TEST[A-Z0-9])-(?:X{5}|0{5}|DUMMY|EXAMP|REDAC|PLACE|HOLDR|TEST[A-Z0-9])$''',
+            ]
+
+          [[rules]]
+          id = "tailscale-key"
+          description = "Tailscale Auth, API, Client, or OAuth Key"
+          regex = '''\btskey-(?:auth|api|client|oauth)-[A-Za-z0-9]+-[A-Za-z0-9_-]{16,}\b'''
+          keywords = ["tskey-"]
+
+            [[rules.allowlists]]
+            description = "Anchored synthetic Tailscale key placeholders"
+            regexTarget = "match"
+            regexes = [
+              '''^tskey-(?:auth|api|client|oauth)-[A-Za-z0-9]+-(?:[Xx]{16,}|0{16,}|(?:EXAMPLE|DUMMY|PLACEHOLDER|REDACTED)[A-Za-z0-9_-]*|[A-Za-z0-9_-]*(?:EXAMPLE|DUMMY|PLACEHOLDER|REDACTED))$''',
+            ]
+          GOVKIT_GITLEAKS_EOF
+            printf 'path=%s\n' "$fallback" >> "$GITHUB_OUTPUT"
+          fi
       - name: Scan for secrets
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || github.token }}
-          GITLEAKS_CONFIG: ${{ inputs.config-path }}
+          GITLEAKS_CONFIG: ${{ steps.config.outputs.path }}
           GITLEAKS_ENABLE_COMMENTS: "false"
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
