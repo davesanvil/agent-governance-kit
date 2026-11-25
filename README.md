@@ -147,6 +147,10 @@ older revisions, and it catches mechanical leaks, not meaning, so a person still
 python3 tools/hygiene_check.py
 ```
 
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and scope.
+
 ## License
 
 MIT
