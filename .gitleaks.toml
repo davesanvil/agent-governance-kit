@@ -1,0 +1,16 @@
+title = "agent-governance-kit gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "onepassword-service-account-token-extended"
+description = "1Password Service Account Token (standard base64, base64url, or short payload)"
+regex = '''ops_[A-Za-z0-9+/._-]{100,}={0,3}'''
+keywords = ["ops_"]
+
+[[rules]]
+id = "onepassword-secret-key"
+description = "1Password Account Secret Key"
+regex = '''A3-[A-Z0-9]{6}-[A-Z0-9-]{20,}'''
+keywords = ["A3-"]
