@@ -147,6 +147,54 @@ older revisions, and it catches mechanical leaks, not meaning, so a person still
 python3 tools/hygiene_check.py
 ```
 
+## Reusable workflows
+
+### `android-play-internal.yml`
+
+[`.github/workflows/android-play-internal.yml`](.github/workflows/android-play-internal.yml) provides a reusable `workflow_call` pipeline for Android Gradle projects building signed `.aab` bundles and releasing to Google Play testing tracks:
+
+- **Credential-free validation by default:** On `pull_request`, `push`, and default `workflow_dispatch` runs (`upload_to_play: false`), the `validate` job computes a monotonic `ANDROID_VERSION_CODE`, runs optional Gradle tests (`test_task`) and `bundle_task` without secrets, pins the bundle SHA-256 digest, uploads an inspection artifact, and skips Play upload cleanly.
+- **Hardened release uploads:** Real uploads run only on `workflow_dispatch` with `upload_to_play: true` (and optional protected GitHub `play_environment`), serialize across all tracks per package (`cancel-in-progress: false` so Play API edits are never invalidated or cancelled mid-flight), require a literal single-file `bundle_path` (no globs or lists), verify both the built `.aab` manifest's embedded `versionCode` and SHA-256 digest (`sha256sum -c`) immediately before upload, decode the signing keystore and Play service account JSON strictly inside `$RUNNER_TEMP` under `umask 077`, and always remove temporary credential files in `if: always()`.
+- **Required Gradle `ANDROID_VERSION_CODE` wiring:** Callers MUST wire `System.getenv("ANDROID_VERSION_CODE")` into Android `versionCode` (including any product flavors) in `build.gradle.kts` / `build.gradle`; both upload jobs parse the built `.aab` manifest and fail closed if the embedded `versionCode` does not match the computed value.
+- **Fail-closed secret handling:** Set `require_secrets: true` on `workflow_dispatch` uploads so missing credentials fail the run instead of silently skipping. Leaving `require_secrets: false` skips upload cleanly with a `::notice::` when secrets are absent.
+- **Draft App API quirk:** The Google Play Developer Publishing API rejects `status: completed` until an app completes its initial manual Play Console rollout and leaves Draft state. Pass `release_status: draft` explicitly while an app is still in Draft state; this workflow never auto-falls back, auto-promotes, or mutates store listing state. Staged rollout statuses (`inProgress`, `halted`) require `user_fraction` strictly between `0` and `1`.
+
+Example caller snippet (pin to an immutable commit SHA from a tagged release, and ensure the named GitHub Environment has Required Reviewers + branch protections configured before enabling uploads):
+
+```yaml
+jobs:
+  android-play:
+    uses: davesanvil/agent-governance-kit/.github/workflows/android-play-internal.yml@<COMMIT_SHA> # v1.1.0
+    with:
+      package_name: com.example.app
+      test_task: ":app:testReleaseUnitTest"
+      upload_to_play: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play }}
+      require_secrets: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play }}
+      play_environment: play-internal
+      release_status: ${{ inputs.release_status || 'completed' }}
+    secrets: inherit
+```
+
+| Input | Default | Purpose |
+|---|---|---|
+| `package_name` | _(required)_ | Android `applicationId` in Google Play Console |
+| `bundle_task` | `:app:bundleRelease` | Gradle task building the `.aab` |
+| `bundle_path` | `app/build/outputs/bundle/release/app-release.aab` | Literal `.aab` output path (globs/lists rejected) |
+| `test_task` | `""` | Optional Gradle test task for credential-free validation |
+| `track` | `internal` | Google Play track (`internal`, `alpha`, `beta`, `production`) |
+| `release_status` | `completed` | Explicit Play release status (`completed`, `draft`, `halted`, `inProgress`) |
+| `user_fraction` | `""` | Rollout fraction `(0, 1)` required for `inProgress` and `halted` |
+| `version_code_offset` | `100` | Base added to `github.run_number` when override is unset |
+| `version_code_override` | `""` | Optional positive integer `versionCode` override |
+| `java_version` | `"17"` | JDK version for `actions/setup-java` |
+| `require_secrets` | `false` | Fail closed on missing secrets during `workflow_dispatch` uploads |
+| `upload_to_play` | `false` | Explicit opt-in for Google Play upload on `workflow_dispatch` |
+| `play_environment` | `""` | Optional protected GitHub `environment` for upload job |
+| `expected_aab_sha256` | `""` | Optional 64-hex SHA-256 pin checked against the signed `.aab` |
+| `upload_bundle_artifact` | `true` | Upload `.aab` + `.sha256` inspection artifact |
+
+Required secrets when uploading (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, `PLAY_SERVICE_ACCOUNT_JSON`) are never written into the workspace or printed in logs.
+
 ## Security
 
 See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and scope.

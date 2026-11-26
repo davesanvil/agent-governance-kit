@@ -1,0 +1,893 @@
+name: android-play-internal
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: Android application ID / Google Play package name (e.g. com.example.app)
+        required: true
+        type: string
+      bundle_task:
+        description: Gradle task that produces the release Android App Bundle (.aab)
+        required: false
+        type: string
+        default: ":app:bundleRelease"
+      bundle_path:
+        description: Literal workspace-relative path to the built release .aab artifact (no globs or lists)
+        required: false
+        type: string
+        default: "app/build/outputs/bundle/release/app-release.aab"
+      test_task:
+        description: Optional Gradle test task run during credential-free validation (empty skips)
+        required: false
+        type: string
+        default: ""
+      track:
+        description: Target Google Play release track (internal, alpha, beta, production)
+        required: false
+        type: string
+        default: "internal"
+      release_status:
+        description: >
+          Explicit Google Play release status (completed, draft, halted, inProgress).
+          Draft App API quirk: Play rejects status=completed until the first release leaves
+          Draft state in Play Console; pass release_status=draft explicitly when needed
+          (this workflow never auto-promotes or mutates listing state).
+        required: false
+        type: string
+        default: "completed"
+      user_fraction:
+        description: >
+          Staged rollout fraction strictly between 0 and 1 (e.g. 0.1). Required when
+          release_status is inProgress or halted; rejected for completed and draft.
+        required: false
+        type: string
+        default: ""
+      version_code_offset:
+        description: Base integer offset added to github.run_number when version_code_override is unset
+        required: false
+        type: number
+        default: 100
+      version_code_override:
+        description: Optional explicit positive integer versionCode override
+        required: false
+        type: string
+        default: ""
+      java_version:
+        description: JDK version passed to actions/setup-java
+        required: false
+        type: string
+        default: "17"
+      require_secrets:
+        description: Fail closed if Play upload secrets are missing or upload is disallowed
+        required: false
+        type: boolean
+        default: false
+      upload_to_play:
+        description: >
+          Explicit gate for uploading to Google Play (requires workflow_dispatch).
+          Defaults to false so PR and default workflow_dispatch runs stay credential-free.
+        required: false
+        type: boolean
+        default: false
+      play_environment:
+        description: Optional protected GitHub deployment environment name for Play uploads
+        required: false
+        type: string
+        default: ""
+      expected_aab_sha256:
+        description: Optional expected SHA-256 hex digest pinned against the signed release .aab
+        required: false
+        type: string
+        default: ""
+      upload_bundle_artifact:
+        description: Upload built .aab and SHA-256 manifest as a workflow inspection artifact
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: false
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      ANDROID_KEY_ALIAS:
+        required: false
+      ANDROID_KEY_PASSWORD:
+        required: false
+      PLAY_SERVICE_ACCOUNT_JSON:
+        required: false
+    outputs:
+      version_code:
+        description: Computed monotonic ANDROID_VERSION_CODE
+        value: ${{ jobs.validate.outputs.version_code }}
+      aab_sha256:
+        description: SHA-256 digest of the signed Play upload bundle (or validation bundle when upload is skipped)
+        value: ${{ jobs.publish.outputs.aab_sha256 || jobs.publish_no_env.outputs.aab_sha256 || jobs.validate.outputs.aab_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Android bundle (credential-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: android-play-validate-${{ github.repository }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    outputs:
+      version_code: ${{ steps.meta.outputs.version_code }}
+      aab_sha256: ${{ steps.bundle.outputs.aab_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and compute ANDROID_VERSION_CODE
+        id: meta
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          BUNDLE_TASK: ${{ inputs.bundle_task }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          TEST_TASK: ${{ inputs.test_task }}
+          TRACK: ${{ inputs.track }}
+          RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
+          VERSION_CODE_OFFSET: ${{ inputs.version_code_offset }}
+          VERSION_CODE_OVERRIDE: ${{ inputs.version_code_override }}
+          REQUIRE_SECRETS: ${{ inputs.require_secrets }}
+          UPLOAD_TO_PLAY: ${{ inputs.upload_to_play }}
+          PLAY_ENVIRONMENT: ${{ inputs.play_environment }}
+          EXPECTED_AAB_SHA256: ${{ inputs.expected_aab_sha256 }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$PACKAGE_NAME" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
+            echo "::error::Invalid package_name format: expected reverse-DNS applicationId" >&2
+            exit 1
+          fi
+          if [[ ! "$BUNDLE_TASK" =~ ^[A-Za-z0-9:._-]+$ ]]; then
+            echo "::error::Invalid bundle_task: single Gradle task token required" >&2
+            exit 1
+          fi
+          if [[ -n "$TEST_TASK" && ! "$TEST_TASK" =~ ^[A-Za-z0-9:._-]+$ ]]; then
+            echo "::error::Invalid test_task: single Gradle task token required" >&2
+            exit 1
+          fi
+          if [[ -z "$BUNDLE_PATH" || "$BUNDLE_PATH" == *$'\n'* || "$BUNDLE_PATH" == *$'\r'* || "$BUNDLE_PATH" == /* || "$BUNDLE_PATH" == *..* ]]; then
+            echo "::error::Invalid bundle_path: must be a clean workspace-relative path" >&2
+            exit 1
+          fi
+          # Reject glob/list metacharacters because upload-google-play expands releaseFiles with fast-glob.
+          if [[ "$BUNDLE_PATH" == *[*?\[\]{},\\]* ]]; then
+            echo "::error::Invalid bundle_path: glob wildcards, braces, and comma lists are disallowed" >&2
+            exit 1
+          fi
+          if [[ ! "$TRACK" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid track name" >&2
+            exit 1
+          fi
+          case "$RELEASE_STATUS" in
+            completed|draft)
+              if [[ -n "$USER_FRACTION" ]]; then
+                echo "::error::user_fraction is not supported when release_status is '$RELEASE_STATUS'" >&2
+                exit 1
+              fi
+              ;;
+            halted|inProgress)
+              if [[ -z "$USER_FRACTION" ]]; then
+                echo "::error::user_fraction is required when release_status is '$RELEASE_STATUS'" >&2
+                exit 1
+              fi
+              python3 - "$USER_FRACTION" <<'PY'
+          import math, re, sys
+          raw = sys.argv[1]
+          if not re.fullmatch(r"(?:0?\.[0-9]+|0\.[0-9]+)", raw):
+              print("::error::user_fraction must be a decimal strictly between 0 and 1", file=sys.stderr)
+              sys.exit(1)
+          val = float(raw)
+          if not math.isfinite(val) or val <= 0.0 or val >= 1.0:
+              print("::error::user_fraction must be strictly between 0 and 1", file=sys.stderr)
+              sys.exit(1)
+          PY
+              ;;
+            *)
+              echo "::error::Invalid release_status '$RELEASE_STATUS'; expected completed, draft, halted, or inProgress" >&2
+              exit 1
+              ;;
+          esac
+          if [[ -n "$EXPECTED_AAB_SHA256" && ! "$EXPECTED_AAB_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::Invalid expected_aab_sha256: expected 64 hexadecimal characters" >&2
+            exit 1
+          fi
+          if [[ "$PLAY_ENVIRONMENT" == *$'\n'* || "$PLAY_ENVIRONMENT" == *$'\r'* ]]; then
+            echo "::error::Invalid play_environment: single-line name required" >&2
+            exit 1
+          fi
+
+          if [[ "$REQUIRE_SECRETS" == "true" ]]; then
+            if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "::error::require_secrets=true is gated to workflow_dispatch events only" >&2
+              exit 1
+            fi
+            if [[ "$UPLOAD_TO_PLAY" != "true" ]]; then
+              echo "::error::require_secrets=true requires upload_to_play=true" >&2
+              exit 1
+            fi
+          fi
+
+          # Bound digit lengths and force base-10 arithmetic so 64-bit integer overflow cannot wrap past bounds.
+          if [[ -n "$VERSION_CODE_OVERRIDE" ]]; then
+            if [[ ! "$VERSION_CODE_OVERRIDE" =~ ^[1-9][0-9]{0,9}$ ]]; then
+              echo "::error::version_code_override must be a positive decimal integer up to 10 digits" >&2
+              exit 1
+            fi
+            version_code=$((10#$VERSION_CODE_OVERRIDE))
+          else
+            if [[ ! "$VERSION_CODE_OFFSET" =~ ^[0-9]{1,9}$ ]]; then
+              echo "::error::version_code_offset must be a non-negative integer up to 9 digits" >&2
+              exit 1
+            fi
+            if [[ ! "$RUN_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]; then
+              echo "::error::Invalid github.run_number" >&2
+              exit 1
+            fi
+            version_code=$((10#$VERSION_CODE_OFFSET + 10#$RUN_NUMBER))
+          fi
+
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "::error::Computed ANDROID_VERSION_CODE ($version_code) outside Play Store bounds [1, 2100000000]" >&2
+            exit 1
+          fi
+
+          printf 'ANDROID_VERSION_CODE=%s\n' "$version_code" >> "$GITHUB_ENV"
+          printf 'version_code=%s\n' "$version_code" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: "temurin"
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Run Gradle tests (credential-free)
+        if: ${{ inputs.test_task != '' }}
+        shell: bash
+        env:
+          TEST_TASK: ${{ inputs.test_task }}
+        run: |
+          set -euo pipefail
+          test -x ./gradlew || chmod +x ./gradlew
+          ./gradlew "$TEST_TASK" --no-daemon
+
+      - name: Build bundle (credential-free)
+        id: bundle
+        shell: bash
+        env:
+          BUNDLE_TASK: ${{ inputs.bundle_task }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          unset ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+          test -x ./gradlew || chmod +x ./gradlew
+          ./gradlew "$BUNDLE_TASK" --no-daemon
+
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular bundle file at '$BUNDLE_PATH'" >&2
+            exit 1
+          fi
+
+          aab_sha256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
+          checksum_file="${RUNNER_TEMP}/validation-bundle.sha256"
+          printf '%s  %s\n' "$aab_sha256" "$BUNDLE_PATH" > "$checksum_file"
+          printf 'aab_sha256=%s\n' "$aab_sha256" >> "$GITHUB_OUTPUT"
+          printf 'checksum_file=%s\n' "$checksum_file" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Android Bundle Validation (Credential-Free)"
+            echo "- Package: \`${PACKAGE_NAME}\`"
+            echo "- Version code: \`${VERSION_CODE}\`"
+            echo "- Bundle SHA-256: \`${aab_sha256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation bundle artifact
+        if: ${{ inputs.upload_bundle_artifact }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-validation-bundle-${{ steps.meta.outputs.version_code }}
+          path: |
+            ${{ inputs.bundle_path }}
+            ${{ steps.bundle.outputs.checksum_file }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report upload gate status
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.upload_to_play) }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          AAB_SHA256: ${{ steps.bundle.outputs.aab_sha256 }}
+        run: |
+          set -euo pipefail
+          echo "::notice::Credential-free validation passed (event=${EVENT_NAME}, versionCode=${VERSION_CODE}, sha256=${AAB_SHA256}); Google Play upload skipped."
+
+      - name: Clean up validation temp files
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/validation-bundle.sha256"
+
+  publish:
+    name: Sign and upload to Google Play (protected environment)
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play && inputs.play_environment != '' }}
+    environment: ${{ inputs.play_environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
+      # Never cancel an active Google Play Developer API edit/upload in flight.
+      group: play-upload-${{ github.repository }}-${{ inputs.package_name }}
+      cancel-in-progress: false
+    outputs:
+      aab_sha256: ${{ steps.sign.outputs.aab_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare signing keystore and Play service account
+        id: creds
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          REQUIRE_SECRETS: ${{ inputs.require_secrets }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" && -z "$PLAY_SERVICE_ACCOUNT_JSON" ]]; then
+            if [[ "$REQUIRE_SECRETS" == "true" ]]; then
+              echo "::error::Missing ANDROID_KEYSTORE_BASE64 and PLAY_SERVICE_ACCOUNT_JSON while require_secrets=true" >&2
+              exit 1
+            fi
+            echo "::notice::Play release secrets are unset and require_secrets=false; skipping signed upload."
+            printf 'ready=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$PLAY_SERVICE_ACCOUNT_JSON" ]]; then
+            echo "::error::Partial Play release credentials configured; both ANDROID_KEYSTORE_BASE64 and PLAY_SERVICE_ACCOUNT_JSON are required" >&2
+            exit 1
+          fi
+          if [[ -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "::error::Missing ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, or ANDROID_KEY_PASSWORD" >&2
+            exit 1
+          fi
+
+          keystore_file="${RUNNER_TEMP}/play-upload.keystore"
+          sa_file="${RUNNER_TEMP}/play-service-account.json"
+
+          (
+            umask 077
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_file"
+            printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$sa_file"
+          )
+
+          if [[ ! -s "$keystore_file" ]]; then
+            echo "::error::Decoded keystore file is empty" >&2
+            exit 1
+          fi
+          if ! python3 -m json.tool "$sa_file" >/dev/null 2>&1; then
+            echo "::error::PLAY_SERVICE_ACCOUNT_JSON is not valid JSON" >&2
+            exit 1
+          fi
+
+          export ANDROID_KEYSTORE_PATH="$keystore_file"
+          printf 'ANDROID_KEYSTORE_PATH=%s\n' "$ANDROID_KEYSTORE_PATH" >> "$GITHUB_ENV"
+          printf 'ANDROID_VERSION_CODE=%s\n' "$VERSION_CODE" >> "$GITHUB_ENV"
+          printf 'ready=true\n' >> "$GITHUB_OUTPUT"
+          printf 'sa_json_path=%s\n' "$sa_file" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: "temurin"
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Build signed bundle, verify manifest versionCode, and pin SHA-256 digest
+        id: sign
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          BUNDLE_TASK: ${{ inputs.bundle_task }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          EXPECTED_AAB_SHA256: ${{ inputs.expected_aab_sha256 }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          if [[ "${ANDROID_VERSION_CODE:-}" != "$EXPECTED_VERSION_CODE" ]]; then
+            echo "::error::Version code drift detected before build" >&2
+            exit 1
+          fi
+          test -x ./gradlew || chmod +x ./gradlew
+          ./gradlew "$BUNDLE_TASK" --no-daemon
+
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular signed bundle at '$BUNDLE_PATH'" >&2
+            exit 1
+          fi
+
+          # Inspect the actual AAB protobuf manifest (aapt.pb.XmlNode) to confirm Gradle applied ANDROID_VERSION_CODE.
+          python3 - "$BUNDLE_PATH" "$EXPECTED_VERSION_CODE" <<'PY'
+          import sys, zipfile
+
+          def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+              val, shift = 0, 0
+              while pos < len(buf):
+                  b = buf[pos]
+                  pos += 1
+                  val |= (b & 0x7F) << shift
+                  if not (b & 0x80):
+                      return val, pos
+                  shift += 7
+              raise ValueError("truncated protobuf varint")
+
+          def iter_fields(buf: bytes):
+              pos = 0
+              while pos < len(buf):
+                  tag, pos = read_varint(buf, pos)
+                  fn, wire = tag >> 3, tag & 7
+                  if wire == 0:
+                      v, pos = read_varint(buf, pos)
+                      yield fn, wire, v
+                  elif wire == 1:
+                      if pos + 8 > len(buf):
+                          raise ValueError("truncated fixed64")
+                      yield fn, wire, buf[pos:pos + 8]
+                      pos += 8
+                  elif wire == 2:
+                      ln, pos = read_varint(buf, pos)
+                      if pos + ln > len(buf):
+                          raise ValueError("truncated length-delimited field")
+                      yield fn, wire, buf[pos:pos + ln]
+                      pos += ln
+                  elif wire == 5:
+                      if pos + 4 > len(buf):
+                          raise ValueError("truncated fixed32")
+                      yield fn, wire, buf[pos:pos + 4]
+                      pos += 4
+                  else:
+                      raise ValueError(f"unsupported protobuf wire type {wire}")
+
+          def extract_manifest_version_code(aab_path: str) -> int:
+              with zipfile.ZipFile(aab_path) as zf:
+                  raw = zf.read("base/manifest/AndroidManifest.xml")
+              root_elem = None
+              for fn, wire, val in iter_fields(raw):
+                  if fn == 1 and wire == 2:
+                      root_elem = val
+                      break
+              if root_elem is None:
+                  raise ValueError("missing XmlNode.element in base/manifest/AndroidManifest.xml")
+              elem_name = ""
+              attrs = []
+              for fn, wire, val in iter_fields(root_elem):
+                  if fn == 3 and wire == 2:
+                      elem_name = val.decode("utf-8", "replace")
+                  elif fn == 4 and wire == 2:
+                      attrs.append(val)
+              if elem_name != "manifest":
+                  raise ValueError(f"unexpected root manifest element {elem_name!r}")
+              for attr in attrs:
+                  name, str_val, res_id, compiled = "", "", 0, b""
+                  for fn, wire, val in iter_fields(attr):
+                      if fn == 2 and wire == 2:
+                          name = val.decode("utf-8", "replace")
+                      elif fn == 3 and wire == 2:
+                          str_val = val.decode("utf-8", "replace")
+                      elif fn == 5 and wire == 0:
+                          res_id = val
+                      elif fn == 6 and wire == 2:
+                          compiled = val
+                  if res_id == 0x0101021B or name == "versionCode":
+                      if compiled:
+                          for ifn, iwire, ival in iter_fields(compiled):
+                              if ifn == 7 and iwire == 2:  # Item.prim
+                                  for pfn, pwire, pval in iter_fields(ival):
+                                      if pfn in (6, 7) and pwire == 0:
+                                          if pfn == 6 and pval >= 2**31:
+                                              pval -= 2**32
+                                          return pval
+                      if str_val:
+                          return int(str_val, 0)
+              raise ValueError("android:versionCode attribute missing from AAB manifest")
+
+          bundle_path, expected = sys.argv[1], int(sys.argv[2])
+          try:
+              actual = extract_manifest_version_code(bundle_path)
+          except Exception as exc:
+              print(f"::error::Failed to inspect AAB manifest versionCode: {exc}", file=sys.stderr)
+              sys.exit(1)
+          if actual != expected:
+              print(
+                  f"::error::Built AAB versionCode ({actual}) does not match ANDROID_VERSION_CODE ({expected}); wire ANDROID_VERSION_CODE in Gradle.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Verified AAB manifest versionCode={actual}")
+          PY
+
+          aab_sha256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
+          if [[ -n "$EXPECTED_AAB_SHA256" && "${aab_sha256,,}" != "${EXPECTED_AAB_SHA256,,}" ]]; then
+            echo "::error::Signed bundle SHA-256 ($aab_sha256) does not match expected_aab_sha256 ($EXPECTED_AAB_SHA256)" >&2
+            exit 1
+          fi
+
+          checksum_file="${RUNNER_TEMP}/signed-bundle.sha256"
+          printf '%s  %s\n' "$aab_sha256" "$BUNDLE_PATH" > "$checksum_file"
+          printf 'aab_sha256=%s\n' "$aab_sha256" >> "$GITHUB_OUTPUT"
+          printf 'checksum_file=%s\n' "$checksum_file" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed bundle inspection artifact
+        if: ${{ steps.creds.outputs.ready == 'true' && inputs.upload_bundle_artifact }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-signed-bundle-${{ needs.validate.outputs.version_code }}
+          path: |
+            ${{ inputs.bundle_path }}
+            ${{ steps.sign.outputs.checksum_file }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify pinned digest and log release metadata
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          CHECKSUM_FILE: ${{ steps.sign.outputs.checksum_file }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          TRACK: ${{ inputs.track }}
+          RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+          AAB_SHA256: ${{ steps.sign.outputs.aab_sha256 }}
+          PLAY_ENVIRONMENT: ${{ inputs.play_environment }}
+        run: |
+          set -euo pipefail
+          sha256sum -c "$CHECKSUM_FILE"
+          {
+            echo "### Google Play Release Upload"
+            echo "- Package: \`${PACKAGE_NAME}\`"
+            echo "- Track: \`${TRACK}\`"
+            echo "- Status: \`${RELEASE_STATUS}\`"
+            if [[ -n "$USER_FRACTION" ]]; then
+              echo "- User fraction: \`${USER_FRACTION}\`"
+            fi
+            echo "- Environment: \`${PLAY_ENVIRONMENT:-none}\`"
+            echo "- Version code: \`${VERSION_CODE}\`"
+            echo "- Pinned AAB SHA-256: \`${AAB_SHA256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Google Play Draft App API quirk:
+      # Play Developer Publishing API rejects status=completed until the app leaves Draft state
+      # after its initial manual Play Console upload and listing setup. Pass release_status=draft
+      # explicitly for Draft apps; never auto-fallback, auto-promote, or mutate listing state.
+      - name: Upload bundle to Google Play
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJson: ${{ steps.creds.outputs.sa_json_path }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: ${{ inputs.bundle_path }}
+          tracks: ${{ inputs.track }}
+          status: ${{ inputs.release_status }}
+          userFraction: ${{ (inputs.release_status == 'inProgress' || inputs.release_status == 'halted') && inputs.user_fraction || '' }}
+
+      - name: Clean up temporary keystore and service account files
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/play-upload.keystore" "${RUNNER_TEMP}/play-service-account.json" "${RUNNER_TEMP}/signed-bundle.sha256"
+
+  publish_no_env:
+    name: Sign and upload to Google Play (no environment)
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play && inputs.play_environment == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
+      # Never cancel an active Google Play Developer API edit/upload in flight.
+      group: play-upload-${{ github.repository }}-${{ inputs.package_name }}
+      cancel-in-progress: false
+    outputs:
+      aab_sha256: ${{ steps.sign.outputs.aab_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare signing keystore and Play service account
+        id: creds
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          REQUIRE_SECRETS: ${{ inputs.require_secrets }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" && -z "$PLAY_SERVICE_ACCOUNT_JSON" ]]; then
+            if [[ "$REQUIRE_SECRETS" == "true" ]]; then
+              echo "::error::Missing ANDROID_KEYSTORE_BASE64 and PLAY_SERVICE_ACCOUNT_JSON while require_secrets=true" >&2
+              exit 1
+            fi
+            echo "::notice::Play release secrets are unset and require_secrets=false; skipping signed upload."
+            printf 'ready=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$PLAY_SERVICE_ACCOUNT_JSON" ]]; then
+            echo "::error::Partial Play release credentials configured; both ANDROID_KEYSTORE_BASE64 and PLAY_SERVICE_ACCOUNT_JSON are required" >&2
+            exit 1
+          fi
+          if [[ -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "::error::Missing ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, or ANDROID_KEY_PASSWORD" >&2
+            exit 1
+          fi
+
+          keystore_file="${RUNNER_TEMP}/play-upload.keystore"
+          sa_file="${RUNNER_TEMP}/play-service-account.json"
+
+          (
+            umask 077
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_file"
+            printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$sa_file"
+          )
+
+          if [[ ! -s "$keystore_file" ]]; then
+            echo "::error::Decoded keystore file is empty" >&2
+            exit 1
+          fi
+          if ! python3 -m json.tool "$sa_file" >/dev/null 2>&1; then
+            echo "::error::PLAY_SERVICE_ACCOUNT_JSON is not valid JSON" >&2
+            exit 1
+          fi
+
+          export ANDROID_KEYSTORE_PATH="$keystore_file"
+          printf 'ANDROID_KEYSTORE_PATH=%s\n' "$ANDROID_KEYSTORE_PATH" >> "$GITHUB_ENV"
+          printf 'ANDROID_VERSION_CODE=%s\n' "$VERSION_CODE" >> "$GITHUB_ENV"
+          printf 'ready=true\n' >> "$GITHUB_OUTPUT"
+          printf 'sa_json_path=%s\n' "$sa_file" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: "temurin"
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Build signed bundle, verify manifest versionCode, and pin SHA-256 digest
+        id: sign
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          BUNDLE_TASK: ${{ inputs.bundle_task }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          EXPECTED_AAB_SHA256: ${{ inputs.expected_aab_sha256 }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          if [[ "${ANDROID_VERSION_CODE:-}" != "$EXPECTED_VERSION_CODE" ]]; then
+            echo "::error::Version code drift detected before build" >&2
+            exit 1
+          fi
+          test -x ./gradlew || chmod +x ./gradlew
+          ./gradlew "$BUNDLE_TASK" --no-daemon
+
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular signed bundle at '$BUNDLE_PATH'" >&2
+            exit 1
+          fi
+
+          # Inspect the actual AAB protobuf manifest (aapt.pb.XmlNode) to confirm Gradle applied ANDROID_VERSION_CODE.
+          python3 - "$BUNDLE_PATH" "$EXPECTED_VERSION_CODE" <<'PY'
+          import sys, zipfile
+
+          def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+              val, shift = 0, 0
+              while pos < len(buf):
+                  b = buf[pos]
+                  pos += 1
+                  val |= (b & 0x7F) << shift
+                  if not (b & 0x80):
+                      return val, pos
+                  shift += 7
+              raise ValueError("truncated protobuf varint")
+
+          def iter_fields(buf: bytes):
+              pos = 0
+              while pos < len(buf):
+                  tag, pos = read_varint(buf, pos)
+                  fn, wire = tag >> 3, tag & 7
+                  if wire == 0:
+                      v, pos = read_varint(buf, pos)
+                      yield fn, wire, v
+                  elif wire == 1:
+                      if pos + 8 > len(buf):
+                          raise ValueError("truncated fixed64")
+                      yield fn, wire, buf[pos:pos + 8]
+                      pos += 8
+                  elif wire == 2:
+                      ln, pos = read_varint(buf, pos)
+                      if pos + ln > len(buf):
+                          raise ValueError("truncated length-delimited field")
+                      yield fn, wire, buf[pos:pos + ln]
+                      pos += ln
+                  elif wire == 5:
+                      if pos + 4 > len(buf):
+                          raise ValueError("truncated fixed32")
+                      yield fn, wire, buf[pos:pos + 4]
+                      pos += 4
+                  else:
+                      raise ValueError(f"unsupported protobuf wire type {wire}")
+
+          def extract_manifest_version_code(aab_path: str) -> int:
+              with zipfile.ZipFile(aab_path) as zf:
+                  raw = zf.read("base/manifest/AndroidManifest.xml")
+              root_elem = None
+              for fn, wire, val in iter_fields(raw):
+                  if fn == 1 and wire == 2:
+                      root_elem = val
+                      break
+              if root_elem is None:
+                  raise ValueError("missing XmlNode.element in base/manifest/AndroidManifest.xml")
+              elem_name = ""
+              attrs = []
+              for fn, wire, val in iter_fields(root_elem):
+                  if fn == 3 and wire == 2:
+                      elem_name = val.decode("utf-8", "replace")
+                  elif fn == 4 and wire == 2:
+                      attrs.append(val)
+              if elem_name != "manifest":
+                  raise ValueError(f"unexpected root manifest element {elem_name!r}")
+              for attr in attrs:
+                  name, str_val, res_id, compiled = "", "", 0, b""
+                  for fn, wire, val in iter_fields(attr):
+                      if fn == 2 and wire == 2:
+                          name = val.decode("utf-8", "replace")
+                      elif fn == 3 and wire == 2:
+                          str_val = val.decode("utf-8", "replace")
+                      elif fn == 5 and wire == 0:
+                          res_id = val
+                      elif fn == 6 and wire == 2:
+                          compiled = val
+                  if res_id == 0x0101021B or name == "versionCode":
+                      if compiled:
+                          for ifn, iwire, ival in iter_fields(compiled):
+                              if ifn == 7 and iwire == 2:  # Item.prim
+                                  for pfn, pwire, pval in iter_fields(ival):
+                                      if pfn in (6, 7) and pwire == 0:
+                                          if pfn == 6 and pval >= 2**31:
+                                              pval -= 2**32
+                                          return pval
+                      if str_val:
+                          return int(str_val, 0)
+              raise ValueError("android:versionCode attribute missing from AAB manifest")
+
+          bundle_path, expected = sys.argv[1], int(sys.argv[2])
+          try:
+              actual = extract_manifest_version_code(bundle_path)
+          except Exception as exc:
+              print(f"::error::Failed to inspect AAB manifest versionCode: {exc}", file=sys.stderr)
+              sys.exit(1)
+          if actual != expected:
+              print(
+                  f"::error::Built AAB versionCode ({actual}) does not match ANDROID_VERSION_CODE ({expected}); wire ANDROID_VERSION_CODE in Gradle.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Verified AAB manifest versionCode={actual}")
+          PY
+
+          aab_sha256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
+          if [[ -n "$EXPECTED_AAB_SHA256" && "${aab_sha256,,}" != "${EXPECTED_AAB_SHA256,,}" ]]; then
+            echo "::error::Signed bundle SHA-256 ($aab_sha256) does not match expected_aab_sha256 ($EXPECTED_AAB_SHA256)" >&2
+            exit 1
+          fi
+
+          checksum_file="${RUNNER_TEMP}/signed-bundle.sha256"
+          printf '%s  %s\n' "$aab_sha256" "$BUNDLE_PATH" > "$checksum_file"
+          printf 'aab_sha256=%s\n' "$aab_sha256" >> "$GITHUB_OUTPUT"
+          printf 'checksum_file=%s\n' "$checksum_file" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed bundle inspection artifact
+        if: ${{ steps.creds.outputs.ready == 'true' && inputs.upload_bundle_artifact }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-signed-bundle-${{ needs.validate.outputs.version_code }}
+          path: |
+            ${{ inputs.bundle_path }}
+            ${{ steps.sign.outputs.checksum_file }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify pinned digest and log release metadata
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          CHECKSUM_FILE: ${{ steps.sign.outputs.checksum_file }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          TRACK: ${{ inputs.track }}
+          RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+          AAB_SHA256: ${{ steps.sign.outputs.aab_sha256 }}
+          PLAY_ENVIRONMENT: ${{ inputs.play_environment }}
+        run: |
+          set -euo pipefail
+          sha256sum -c "$CHECKSUM_FILE"
+          {
+            echo "### Google Play Release Upload"
+            echo "- Package: \`${PACKAGE_NAME}\`"
+            echo "- Track: \`${TRACK}\`"
+            echo "- Status: \`${RELEASE_STATUS}\`"
+            if [[ -n "$USER_FRACTION" ]]; then
+              echo "- User fraction: \`${USER_FRACTION}\`"
+            fi
+            echo "- Environment: \`${PLAY_ENVIRONMENT:-none}\`"
+            echo "- Version code: \`${VERSION_CODE}\`"
+            echo "- Pinned AAB SHA-256: \`${AAB_SHA256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Google Play Draft App API quirk:
+      # Play Developer Publishing API rejects status=completed until the app leaves Draft state
+      # after its initial manual Play Console upload and listing setup. Pass release_status=draft
+      # explicitly for Draft apps; never auto-fallback, auto-promote, or mutate listing state.
+      - name: Upload bundle to Google Play
+        if: ${{ steps.creds.outputs.ready == 'true' }}
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJson: ${{ steps.creds.outputs.sa_json_path }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: ${{ inputs.bundle_path }}
+          tracks: ${{ inputs.track }}
+          status: ${{ inputs.release_status }}
+          userFraction: ${{ (inputs.release_status == 'inProgress' || inputs.release_status == 'halted') && inputs.user_fraction || '' }}
+
+      - name: Clean up temporary keystore and service account files
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/play-upload.keystore" "${RUNNER_TEMP}/play-service-account.json" "${RUNNER_TEMP}/signed-bundle.sha256"
