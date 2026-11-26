@@ -111,7 +111,7 @@ jobs:
   validate:
     name: Validate Android bundle (credential-free)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: android-play-validate-${{ github.repository }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -331,7 +331,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play && inputs.play_environment != '' }}
     environment: ${{ inputs.play_environment }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
       # Never cancel an active Google Play Developer API edit/upload in flight.
@@ -614,7 +614,7 @@ jobs:
     needs: validate
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_play && inputs.play_environment == '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
       # Never cancel an active Google Play Developer API edit/upload in flight.
