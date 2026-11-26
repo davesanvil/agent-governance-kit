@@ -13,7 +13,7 @@ on:
         type: string
         default: ":app:bundleRelease"
       bundle_path:
-        description: Workspace-relative path to the built release .aab artifact
+        description: Literal workspace-relative path to the built release .aab artifact (no globs or lists)
         required: false
         type: string
         default: "app/build/outputs/bundle/release/app-release.aab"
@@ -36,6 +36,13 @@ on:
         required: false
         type: string
         default: "completed"
+      user_fraction:
+        description: >
+          Staged rollout fraction strictly between 0 and 1 (e.g. 0.1). Required when
+          release_status is inProgress or halted; rejected for completed and draft.
+        required: false
+        type: string
+        default: ""
       version_code_offset:
         description: Base integer offset added to github.run_number when version_code_override is unset
         required: false
@@ -127,6 +134,7 @@ jobs:
           TEST_TASK: ${{ inputs.test_task }}
           TRACK: ${{ inputs.track }}
           RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
           VERSION_CODE_OFFSET: ${{ inputs.version_code_offset }}
           VERSION_CODE_OVERRIDE: ${{ inputs.version_code_override }}
           REQUIRE_SECRETS: ${{ inputs.require_secrets }}
@@ -154,12 +162,39 @@ jobs:
             echo "::error::Invalid bundle_path: must be a clean workspace-relative path" >&2
             exit 1
           fi
+          # Reject glob/list metacharacters because upload-google-play expands releaseFiles with fast-glob.
+          if [[ "$BUNDLE_PATH" == *[*?\[\]{},\\]* ]]; then
+            echo "::error::Invalid bundle_path: glob wildcards, braces, and comma lists are disallowed" >&2
+            exit 1
+          fi
           if [[ ! "$TRACK" =~ ^[A-Za-z0-9_.-]+$ ]]; then
             echo "::error::Invalid track name" >&2
             exit 1
           fi
           case "$RELEASE_STATUS" in
-            completed|draft|halted|inProgress) ;;
+            completed|draft)
+              if [[ -n "$USER_FRACTION" ]]; then
+                echo "::error::user_fraction is not supported when release_status is '$RELEASE_STATUS'" >&2
+                exit 1
+              fi
+              ;;
+            halted|inProgress)
+              if [[ -z "$USER_FRACTION" ]]; then
+                echo "::error::user_fraction is required when release_status is '$RELEASE_STATUS'" >&2
+                exit 1
+              fi
+              python3 - "$USER_FRACTION" <<'PY'
+          import math, re, sys
+          raw = sys.argv[1]
+          if not re.fullmatch(r"(?:0?\.[0-9]+|0\.[0-9]+)", raw):
+              print("::error::user_fraction must be a decimal strictly between 0 and 1", file=sys.stderr)
+              sys.exit(1)
+          val = float(raw)
+          if not math.isfinite(val) or val <= 0.0 or val >= 1.0:
+              print("::error::user_fraction must be strictly between 0 and 1", file=sys.stderr)
+              sys.exit(1)
+          PY
+              ;;
             *)
               echo "::error::Invalid release_status '$RELEASE_STATUS'; expected completed, draft, halted, or inProgress" >&2
               exit 1
@@ -185,22 +220,23 @@ jobs:
             fi
           fi
 
+          # Bound digit lengths and force base-10 arithmetic so 64-bit integer overflow cannot wrap past bounds.
           if [[ -n "$VERSION_CODE_OVERRIDE" ]]; then
-            if [[ ! "$VERSION_CODE_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::version_code_override must be a positive integer" >&2
+            if [[ ! "$VERSION_CODE_OVERRIDE" =~ ^[1-9][0-9]{0,9}$ ]]; then
+              echo "::error::version_code_override must be a positive decimal integer up to 10 digits" >&2
               exit 1
             fi
-            version_code="$VERSION_CODE_OVERRIDE"
+            version_code=$((10#$VERSION_CODE_OVERRIDE))
           else
-            if [[ ! "$VERSION_CODE_OFFSET" =~ ^[0-9]+$ ]]; then
-              echo "::error::version_code_offset must be a non-negative integer" >&2
+            if [[ ! "$VERSION_CODE_OFFSET" =~ ^[0-9]{1,9}$ ]]; then
+              echo "::error::version_code_offset must be a non-negative integer up to 9 digits" >&2
               exit 1
             fi
-            if [[ ! "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            if [[ ! "$RUN_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]; then
               echo "::error::Invalid github.run_number" >&2
               exit 1
             fi
-            version_code=$((VERSION_CODE_OFFSET + RUN_NUMBER))
+            version_code=$((10#$VERSION_CODE_OFFSET + 10#$RUN_NUMBER))
           fi
 
           if (( version_code < 1 || version_code > 2100000000 )); then
@@ -244,8 +280,8 @@ jobs:
           test -x ./gradlew || chmod +x ./gradlew
           ./gradlew "$BUNDLE_TASK" --no-daemon
 
-          if [[ ! -s "$BUNDLE_PATH" ]]; then
-            echo "::error::Expected non-empty bundle at '$BUNDLE_PATH'" >&2
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular bundle file at '$BUNDLE_PATH'" >&2
             exit 1
           fi
 
@@ -297,8 +333,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
+      # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
       # Never cancel an active Google Play Developer API edit/upload in flight.
-      group: android-play-upload-${{ github.repository }}-${{ inputs.package_name }}-${{ inputs.track }}
+      group: play-upload-${{ github.repository }}-${{ inputs.package_name }}
       cancel-in-progress: false
     outputs:
       aab_sha256: ${{ steps.sign.outputs.aab_sha256 }}
@@ -376,7 +413,7 @@ jobs:
         if: ${{ steps.creds.outputs.ready == 'true' }}
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Build signed bundle and pin SHA-256 digest
+      - name: Build signed bundle, verify manifest versionCode, and pin SHA-256 digest
         id: sign
         if: ${{ steps.creds.outputs.ready == 'true' }}
         shell: bash
@@ -397,10 +434,110 @@ jobs:
           test -x ./gradlew || chmod +x ./gradlew
           ./gradlew "$BUNDLE_TASK" --no-daemon
 
-          if [[ ! -s "$BUNDLE_PATH" ]]; then
-            echo "::error::Expected signed release bundle at '$BUNDLE_PATH'" >&2
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular signed bundle at '$BUNDLE_PATH'" >&2
             exit 1
           fi
+
+          # Inspect the actual AAB protobuf manifest (aapt.pb.XmlNode) to confirm Gradle applied ANDROID_VERSION_CODE.
+          python3 - "$BUNDLE_PATH" "$EXPECTED_VERSION_CODE" <<'PY'
+          import sys, zipfile
+
+          def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+              val, shift = 0, 0
+              while pos < len(buf):
+                  b = buf[pos]
+                  pos += 1
+                  val |= (b & 0x7F) << shift
+                  if not (b & 0x80):
+                      return val, pos
+                  shift += 7
+              raise ValueError("truncated protobuf varint")
+
+          def iter_fields(buf: bytes):
+              pos = 0
+              while pos < len(buf):
+                  tag, pos = read_varint(buf, pos)
+                  fn, wire = tag >> 3, tag & 7
+                  if wire == 0:
+                      v, pos = read_varint(buf, pos)
+                      yield fn, wire, v
+                  elif wire == 1:
+                      if pos + 8 > len(buf):
+                          raise ValueError("truncated fixed64")
+                      yield fn, wire, buf[pos:pos + 8]
+                      pos += 8
+                  elif wire == 2:
+                      ln, pos = read_varint(buf, pos)
+                      if pos + ln > len(buf):
+                          raise ValueError("truncated length-delimited field")
+                      yield fn, wire, buf[pos:pos + ln]
+                      pos += ln
+                  elif wire == 5:
+                      if pos + 4 > len(buf):
+                          raise ValueError("truncated fixed32")
+                      yield fn, wire, buf[pos:pos + 4]
+                      pos += 4
+                  else:
+                      raise ValueError(f"unsupported protobuf wire type {wire}")
+
+          def extract_manifest_version_code(aab_path: str) -> int:
+              with zipfile.ZipFile(aab_path) as zf:
+                  raw = zf.read("base/manifest/AndroidManifest.xml")
+              root_elem = None
+              for fn, wire, val in iter_fields(raw):
+                  if fn == 1 and wire == 2:
+                      root_elem = val
+                      break
+              if root_elem is None:
+                  raise ValueError("missing XmlNode.element in base/manifest/AndroidManifest.xml")
+              elem_name = ""
+              attrs = []
+              for fn, wire, val in iter_fields(root_elem):
+                  if fn == 3 and wire == 2:
+                      elem_name = val.decode("utf-8", "replace")
+                  elif fn == 4 and wire == 2:
+                      attrs.append(val)
+              if elem_name != "manifest":
+                  raise ValueError(f"unexpected root manifest element {elem_name!r}")
+              for attr in attrs:
+                  name, str_val, res_id, compiled = "", "", 0, b""
+                  for fn, wire, val in iter_fields(attr):
+                      if fn == 2 and wire == 2:
+                          name = val.decode("utf-8", "replace")
+                      elif fn == 3 and wire == 2:
+                          str_val = val.decode("utf-8", "replace")
+                      elif fn == 5 and wire == 0:
+                          res_id = val
+                      elif fn == 6 and wire == 2:
+                          compiled = val
+                  if res_id == 0x0101021B or name == "versionCode":
+                      if compiled:
+                          for ifn, iwire, ival in iter_fields(compiled):
+                              if ifn == 7 and iwire == 2:  # Item.prim
+                                  for pfn, pwire, pval in iter_fields(ival):
+                                      if pfn in (6, 7) and pwire == 0:
+                                          if pfn == 6 and pval >= 2**31:
+                                              pval -= 2**32
+                                          return pval
+                      if str_val:
+                          return int(str_val, 0)
+              raise ValueError("android:versionCode attribute missing from AAB manifest")
+
+          bundle_path, expected = sys.argv[1], int(sys.argv[2])
+          try:
+              actual = extract_manifest_version_code(bundle_path)
+          except Exception as exc:
+              print(f"::error::Failed to inspect AAB manifest versionCode: {exc}", file=sys.stderr)
+              sys.exit(1)
+          if actual != expected:
+              print(
+                  f"::error::Built AAB versionCode ({actual}) does not match ANDROID_VERSION_CODE ({expected}); wire ANDROID_VERSION_CODE in Gradle.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Verified AAB manifest versionCode={actual}")
+          PY
 
           aab_sha256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
           if [[ -n "$EXPECTED_AAB_SHA256" && "${aab_sha256,,}" != "${EXPECTED_AAB_SHA256,,}" ]]; then
@@ -432,6 +569,7 @@ jobs:
           PACKAGE_NAME: ${{ inputs.package_name }}
           TRACK: ${{ inputs.track }}
           RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
           VERSION_CODE: ${{ needs.validate.outputs.version_code }}
           AAB_SHA256: ${{ steps.sign.outputs.aab_sha256 }}
           PLAY_ENVIRONMENT: ${{ inputs.play_environment }}
@@ -443,6 +581,9 @@ jobs:
             echo "- Package: \`${PACKAGE_NAME}\`"
             echo "- Track: \`${TRACK}\`"
             echo "- Status: \`${RELEASE_STATUS}\`"
+            if [[ -n "$USER_FRACTION" ]]; then
+              echo "- User fraction: \`${USER_FRACTION}\`"
+            fi
             echo "- Environment: \`${PLAY_ENVIRONMENT:-none}\`"
             echo "- Version code: \`${VERSION_CODE}\`"
             echo "- Pinned AAB SHA-256: \`${AAB_SHA256}\`"
@@ -461,6 +602,7 @@ jobs:
           releaseFiles: ${{ inputs.bundle_path }}
           tracks: ${{ inputs.track }}
           status: ${{ inputs.release_status }}
+          userFraction: ${{ (inputs.release_status == 'inProgress' || inputs.release_status == 'halted') && inputs.user_fraction || '' }}
 
       - name: Clean up temporary keystore and service account files
         if: always()
@@ -474,8 +616,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
+      # Serialize uploads across all tracks per app: Google Play Publisher edits are application-wide.
       # Never cancel an active Google Play Developer API edit/upload in flight.
-      group: android-play-upload-${{ github.repository }}-${{ inputs.package_name }}-${{ inputs.track }}
+      group: play-upload-${{ github.repository }}-${{ inputs.package_name }}
       cancel-in-progress: false
     outputs:
       aab_sha256: ${{ steps.sign.outputs.aab_sha256 }}
@@ -553,7 +696,7 @@ jobs:
         if: ${{ steps.creds.outputs.ready == 'true' }}
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Build signed bundle and pin SHA-256 digest
+      - name: Build signed bundle, verify manifest versionCode, and pin SHA-256 digest
         id: sign
         if: ${{ steps.creds.outputs.ready == 'true' }}
         shell: bash
@@ -574,10 +717,110 @@ jobs:
           test -x ./gradlew || chmod +x ./gradlew
           ./gradlew "$BUNDLE_TASK" --no-daemon
 
-          if [[ ! -s "$BUNDLE_PATH" ]]; then
-            echo "::error::Expected signed release bundle at '$BUNDLE_PATH'" >&2
+          if [[ ! -f "$BUNDLE_PATH" || -L "$BUNDLE_PATH" || ! -s "$BUNDLE_PATH" ]]; then
+            echo "::error::Expected non-empty regular signed bundle at '$BUNDLE_PATH'" >&2
             exit 1
           fi
+
+          # Inspect the actual AAB protobuf manifest (aapt.pb.XmlNode) to confirm Gradle applied ANDROID_VERSION_CODE.
+          python3 - "$BUNDLE_PATH" "$EXPECTED_VERSION_CODE" <<'PY'
+          import sys, zipfile
+
+          def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+              val, shift = 0, 0
+              while pos < len(buf):
+                  b = buf[pos]
+                  pos += 1
+                  val |= (b & 0x7F) << shift
+                  if not (b & 0x80):
+                      return val, pos
+                  shift += 7
+              raise ValueError("truncated protobuf varint")
+
+          def iter_fields(buf: bytes):
+              pos = 0
+              while pos < len(buf):
+                  tag, pos = read_varint(buf, pos)
+                  fn, wire = tag >> 3, tag & 7
+                  if wire == 0:
+                      v, pos = read_varint(buf, pos)
+                      yield fn, wire, v
+                  elif wire == 1:
+                      if pos + 8 > len(buf):
+                          raise ValueError("truncated fixed64")
+                      yield fn, wire, buf[pos:pos + 8]
+                      pos += 8
+                  elif wire == 2:
+                      ln, pos = read_varint(buf, pos)
+                      if pos + ln > len(buf):
+                          raise ValueError("truncated length-delimited field")
+                      yield fn, wire, buf[pos:pos + ln]
+                      pos += ln
+                  elif wire == 5:
+                      if pos + 4 > len(buf):
+                          raise ValueError("truncated fixed32")
+                      yield fn, wire, buf[pos:pos + 4]
+                      pos += 4
+                  else:
+                      raise ValueError(f"unsupported protobuf wire type {wire}")
+
+          def extract_manifest_version_code(aab_path: str) -> int:
+              with zipfile.ZipFile(aab_path) as zf:
+                  raw = zf.read("base/manifest/AndroidManifest.xml")
+              root_elem = None
+              for fn, wire, val in iter_fields(raw):
+                  if fn == 1 and wire == 2:
+                      root_elem = val
+                      break
+              if root_elem is None:
+                  raise ValueError("missing XmlNode.element in base/manifest/AndroidManifest.xml")
+              elem_name = ""
+              attrs = []
+              for fn, wire, val in iter_fields(root_elem):
+                  if fn == 3 and wire == 2:
+                      elem_name = val.decode("utf-8", "replace")
+                  elif fn == 4 and wire == 2:
+                      attrs.append(val)
+              if elem_name != "manifest":
+                  raise ValueError(f"unexpected root manifest element {elem_name!r}")
+              for attr in attrs:
+                  name, str_val, res_id, compiled = "", "", 0, b""
+                  for fn, wire, val in iter_fields(attr):
+                      if fn == 2 and wire == 2:
+                          name = val.decode("utf-8", "replace")
+                      elif fn == 3 and wire == 2:
+                          str_val = val.decode("utf-8", "replace")
+                      elif fn == 5 and wire == 0:
+                          res_id = val
+                      elif fn == 6 and wire == 2:
+                          compiled = val
+                  if res_id == 0x0101021B or name == "versionCode":
+                      if compiled:
+                          for ifn, iwire, ival in iter_fields(compiled):
+                              if ifn == 7 and iwire == 2:  # Item.prim
+                                  for pfn, pwire, pval in iter_fields(ival):
+                                      if pfn in (6, 7) and pwire == 0:
+                                          if pfn == 6 and pval >= 2**31:
+                                              pval -= 2**32
+                                          return pval
+                      if str_val:
+                          return int(str_val, 0)
+              raise ValueError("android:versionCode attribute missing from AAB manifest")
+
+          bundle_path, expected = sys.argv[1], int(sys.argv[2])
+          try:
+              actual = extract_manifest_version_code(bundle_path)
+          except Exception as exc:
+              print(f"::error::Failed to inspect AAB manifest versionCode: {exc}", file=sys.stderr)
+              sys.exit(1)
+          if actual != expected:
+              print(
+                  f"::error::Built AAB versionCode ({actual}) does not match ANDROID_VERSION_CODE ({expected}); wire ANDROID_VERSION_CODE in Gradle.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Verified AAB manifest versionCode={actual}")
+          PY
 
           aab_sha256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
           if [[ -n "$EXPECTED_AAB_SHA256" && "${aab_sha256,,}" != "${EXPECTED_AAB_SHA256,,}" ]]; then
@@ -609,6 +852,7 @@ jobs:
           PACKAGE_NAME: ${{ inputs.package_name }}
           TRACK: ${{ inputs.track }}
           RELEASE_STATUS: ${{ inputs.release_status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
           VERSION_CODE: ${{ needs.validate.outputs.version_code }}
           AAB_SHA256: ${{ steps.sign.outputs.aab_sha256 }}
           PLAY_ENVIRONMENT: ${{ inputs.play_environment }}
@@ -620,6 +864,9 @@ jobs:
             echo "- Package: \`${PACKAGE_NAME}\`"
             echo "- Track: \`${TRACK}\`"
             echo "- Status: \`${RELEASE_STATUS}\`"
+            if [[ -n "$USER_FRACTION" ]]; then
+              echo "- User fraction: \`${USER_FRACTION}\`"
+            fi
             echo "- Environment: \`${PLAY_ENVIRONMENT:-none}\`"
             echo "- Version code: \`${VERSION_CODE}\`"
             echo "- Pinned AAB SHA-256: \`${AAB_SHA256}\`"
@@ -638,6 +885,7 @@ jobs:
           releaseFiles: ${{ inputs.bundle_path }}
           tracks: ${{ inputs.track }}
           status: ${{ inputs.release_status }}
+          userFraction: ${{ (inputs.release_status == 'inProgress' || inputs.release_status == 'halted') && inputs.user_fraction || '' }}
 
       - name: Clean up temporary keystore and service account files
         if: always()
